@@ -13,7 +13,7 @@ import (
 	"github.com/naiba/nezha/pkg/utils"
 )
 
-var Version = "v0.19.18"
+var Version = "v0.19.20"
 
 var (
 	Conf  *model.Config
