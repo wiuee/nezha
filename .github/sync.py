@@ -52,10 +52,7 @@ def delete_gitee_releases(latest_id, client, uri, token):
     print(f'Current release ids: {release_ids}')
     release_ids.remove(latest_id)
 
-    # 2024.12.01 保留 v0 开头的 Release
     for id in release_ids:
-        if id.startswith('v0'):
-            continue
         release_uri = f"{uri}/{id}"
         delete_data = {
             'access_token': token
@@ -121,8 +118,7 @@ def sync_to_gitee(tag: str, body: str, files: slice):
 
     # 仅保留最新 Release 以防超出 Gitee 仓库配额
     try:
-        delete_gitee_releases(release_id, api_client,
-                              release_api_uri, access_token)
+        delete_gitee_releases(release_id, api_client, release_api_uri, access_token)
     except ValueError as e:
         print(e)
 
