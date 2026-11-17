@@ -152,8 +152,8 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
 
-  docker:
-    name: Publish Linux amd64/arm64 Docker image
+  linux-docker:
+    name: Publish Linux amd64/arm64 images
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -164,9 +164,10 @@ jobs:
           path: source
           persist-credentials: false
 
-      - name: Download build artifacts
+      - name: Download Linux build artifacts
         uses: actions/download-artifact@v8
         with:
+          pattern: dashboard-linux-*
           path: assets
 
       - name: Prepare Linux Docker build context
@@ -190,7 +191,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build and push v2.6.1 image
+      - name: Build and push Linux images
         uses: docker/build-push-action@v7
         with:
           context: source
@@ -199,7 +200,154 @@ jobs:
           provenance: false
           sbom: false
           push: true
-          tags: ghcr.io/wiuee/nezha:v2.6.1
+          tags: ghcr.io/wiuee/nezha:v2.6.1-linux
 
-      - name: Verify published image platforms
-        run: docker buildx imagetools inspect ghcr.io/wiuee/nezha:v2.6.1
+      - name: Verify Linux architectures and version
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:v2.6.1-linux"
+          for ARCH in amd64 arm64; do
+            VERSION="$(docker run --rm --platform "linux/$ARCH" --entrypoint /dashboard/app "$IMAGE" -v)"
+            if [[ "$VERSION" != "2.6.1" ]]; then
+              echo "::error::linux/$ARCH returned version $VERSION instead of 2.6.1"
+              exit 1
+            fi
+            echo "linux/$ARCH version: $VERSION"
+          done
+
+  windows-docker:
+    name: Publish Windows ${{ matrix.arch }} image
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2022
+            base: mcr.microsoft.com/windows/servercore:ltsc2022
+          - arch: arm64
+            runner: windows-11-arm
+            base: mcr.microsoft.com/windows/servercore:ltsc2025-arm64
+    env:
+      MATRIX_ARCH: ${{ matrix.arch }}
+      WINDOWS_BASE: ${{ matrix.base }}
+    steps:
+      - name: Checkout Windows Dockerfile
+        uses: actions/checkout@v7.0.1
+        with:
+          path: .ci
+          sparse-checkout: Dockerfile.windows
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Checkout v2.6.1 source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.SOURCE_TAG }}
+          path: source
+          persist-credentials: false
+
+      - name: Download Windows build artifact
+        uses: actions/download-artifact@v8
+        with:
+          pattern: dashboard-windows-*
+          path: assets
+
+      - name: Prepare Windows Docker build context
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path source\dist | Out-Null
+          $binary = Get-ChildItem -Path assets -Recurse -File -Filter "dashboard-windows-$env:MATRIX_ARCH.exe" | Select-Object -First 1
+          if ($null -eq $binary) { throw "Missing dashboard-windows-$env:MATRIX_ARCH.exe" }
+          Copy-Item $binary.FullName "source\dist\dashboard-windows-$env:MATRIX_ARCH.exe"
+          Copy-Item .ci\Dockerfile.windows source\Dockerfile.windows
+
+      - name: Set up Docker for Windows ARM64
+        if: matrix.arch == 'arm64'
+        uses: ndabas/setup-moby-windows-arm64@e9755ab43b45a2a3ed50acb8b8ac57af753588db
+        with:
+          version: docker-v29.9.3
+          skip-if-present: "false"
+
+      - name: Check Docker engine
+        shell: pwsh
+        run: |
+          docker version
+          if ($LASTEXITCODE -ne 0) { throw "Docker engine is not ready" }
+
+      - name: Log in to GHCR
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $env:GH_TOKEN | docker login ghcr.io --username "${{ github.repository_owner }}" --password-stdin
+          if ($LASTEXITCODE -ne 0) { throw "GHCR login failed" }
+
+      - name: Build Windows image
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repository = "ghcr.io/$($env:GITHUB_REPOSITORY.ToLower())"
+          $image = "${repository}:v2.6.1-windows-$env:MATRIX_ARCH"
+          $arguments = @(
+            'build', '--file', 'Dockerfile.windows',
+            '--build-arg', "TARGETARCH=$env:MATRIX_ARCH",
+            '--build-arg', "WINDOWS_BASE=$env:WINDOWS_BASE",
+            '--tag', $image, '.'
+          )
+          & docker @arguments
+          if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE" }
+          $actual = & docker image inspect $image --format '{{.Os}}/{{.Architecture}}'
+          if ($actual -ne "windows/$env:MATRIX_ARCH") {
+            throw "Expected windows/$env:MATRIX_ARCH, got $actual"
+          }
+          "IMAGE=$image" >> $env:GITHUB_ENV
+
+      - name: Verify Windows executable and version
+        shell: pwsh
+        run: |
+          $version = (& docker run --rm $env:IMAGE -v | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Windows dashboard failed to start" }
+          if ($version -ne '2.6.1') { throw "Expected version 2.6.1, got $version" }
+          Write-Host "windows/$env:MATRIX_ARCH version: $version"
+
+      - name: Push verified Windows image
+        shell: pwsh
+        run: |
+          docker push $env:IMAGE
+          if ($LASTEXITCODE -ne 0) { throw "docker push failed for $env:IMAGE" }
+
+  manifest:
+    name: Merge and verify four-platform Docker manifest
+    needs: [linux-docker, windows-docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Publish and verify v2.6.1 manifest
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SOURCES=(
+            "$IMAGE:v2.6.1-linux"
+            "$IMAGE:v2.6.1-windows-amd64"
+            "$IMAGE:v2.6.1-windows-arm64"
+          )
+          docker buildx imagetools create -t "$IMAGE:v2.6.1" "${SOURCES[@]}"
+          docker buildx imagetools inspect "$IMAGE:v2.6.1" | tee manifest.txt
+          for PLATFORM in linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+            grep -Eq "Platform:[[:space:]]+$PLATFORM([[:space:]]|$)" manifest.txt \
+              || { echo "::error::$IMAGE:v2.6.1 is missing $PLATFORM"; exit 1; }
+          done

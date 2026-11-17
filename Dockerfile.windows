@@ -1,0 +1,18 @@
+# escape=`
+
+# Build on windows-2022 with TARGETARCH=amd64 and the ltsc2022 base,
+# or on windows-11-arm with TARGETARCH=arm64 and the ltsc2025-arm64 base.
+ARG WINDOWS_BASE=mcr.microsoft.com/windows/servercore:ltsc2022
+
+FROM ${WINDOWS_BASE}
+ARG TARGETARCH=amd64
+
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+
+WORKDIR C:\dashboard
+COPY dist/dashboard-windows-${TARGETARCH}.exe C:\dashboard\app.exe
+
+VOLUME ["C:\\dashboard\\data"]
+EXPOSE 8008
+ENV TZ=Asia/Shanghai
+ENTRYPOINT ["C:\\dashboard\\app.exe"]
