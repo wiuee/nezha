@@ -1,0 +1,205 @@
+name: Build v2.6.1 multi-platform
+
+on:
+  push:
+    branches:
+      - build/v2.6.1-multiplatform
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: v2.6.1-multiplatform-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_TAG: v2.6.1
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    runs-on: ubuntu-latest
+    container:
+      image: goreleaser/goreleaser-cross:v1.26
+    steps:
+      - name: Trust workspace directories
+        run: git config --global --add safe.directory '*'
+
+      - name: Checkout build configuration
+        uses: actions/checkout@v7.0.1
+        with:
+          path: .ci
+          sparse-checkout: .github/multiplatform-v2.6.1.goreleaser.yml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Checkout v2.6.1 source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.SOURCE_TAG }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          apt update
+          apt install unzip curl zip make -y
+          curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/bin/yq
+          chmod +x /usr/bin/yq
+
+      - name: Prepare frontend distributions
+        working-directory: source
+        run: |
+          chmod +x ./script/fetch-frontends.sh
+          ./script/fetch-frontends.sh
+
+      - name: Refresh IPInfo GeoIP database when configured
+        working-directory: source
+        env:
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
+        run: |
+          if [ -n "$IPINFO_TOKEN" ]; then
+            curl -fsSL "https://ipinfo.io/data/free/country.mmdb?token=${IPINFO_TOKEN}" -o pkg/geoip/geoip.db
+          else
+            echo "IPINFO_TOKEN is not configured; using the database bundled with v2.6.1."
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "^1.26.6"
+          cache: false
+
+      - name: Generate Swagger docs
+        working-directory: source
+        run: |
+          go install github.com/swaggo/swag/cmd/swag@v1.16.6
+          swag init --pd -d cmd/dashboard -g main.go -o cmd/dashboard/docs
+          go mod tidy
+
+      - name: Build zstd for Windows arm64
+        if: matrix.goos == 'windows' && matrix.goarch == 'arm64'
+        working-directory: source
+        run: |
+          go mod vendor
+          git clone --depth 1 --branch v1.5.7 https://github.com/facebook/zstd /tmp/zstd
+          make -C /tmp/zstd/lib clean libzstd.a \
+            CC=/llvm-mingw/bin/aarch64-w64-mingw32-gcc \
+            CXX=/llvm-mingw/bin/aarch64-w64-mingw32-g++ \
+            AR=/llvm-mingw/bin/aarch64-w64-mingw32-ar \
+            ZSTD_LEGACY_SUPPORT=0
+          GOZSTD_VENDOR="$GITHUB_WORKSPACE/source/vendor/github.com/valyala/gozstd"
+          cp /tmp/zstd/lib/libzstd.a "$GOZSTD_VENDOR/libzstd_windows_arm64.a"
+          printf '//go:build windows && arm64\n\npackage gozstd\n\n/*\n#cgo LDFLAGS: ${SRCDIR}/libzstd_windows_arm64.a\n*/\nimport "C"\n' > "$GOZSTD_VENDOR/libzstd_windows_arm64.go"
+
+      - name: Build target
+        uses: goreleaser/goreleaser-action@v7
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          workdir: source
+          args: build --config ../.ci/.github/multiplatform-v2.6.1.goreleaser.yml --single-target --clean --skip=validate --snapshot
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: source/dist/*/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish v2.6.1 platform archives
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: assets
+
+      - name: Create platform archives
+        run: |
+          find assets -type f -name 'dashboard-*' -print0 | while IFS= read -r -d '' file; do
+            archive="${file%.exe}.zip"
+            zip -j "$archive" "$file"
+          done
+
+      - name: Publish release archives
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v2.6.1
+          name: v2.6.1
+          files: assets/**/*.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  docker:
+    name: Publish Linux amd64/arm64 Docker image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout v2.6.1 source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.SOURCE_TAG }}
+          path: source
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: assets
+
+      - name: Prepare Linux Docker build context
+        run: |
+          mkdir -p source/dist
+          find assets -type f \( -name 'dashboard-linux-amd64' -o -name 'dashboard-linux-arm64' \) -exec cp {} source/dist/ \;
+          chmod +x source/dist/dashboard-linux-*
+          test -x source/dist/dashboard-linux-amd64
+          test -x source/dist/dashboard-linux-arm64
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push v2.6.1 image
+        uses: docker/build-push-action@v7
+        with:
+          context: source
+          file: source/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          sbom: false
+          push: true
+          tags: ghcr.io/wiuee/nezha:v2.6.1
+
+      - name: Verify published image platforms
+        run: docker buildx imagetools inspect ghcr.io/wiuee/nezha:v2.6.1
